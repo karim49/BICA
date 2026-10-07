@@ -1,0 +1,177 @@
+import tensorflow as tf
+from tensorflow.keras import layers, Model
+from tensorflow.keras.layers import *
+from tensorflow.keras.constraints import MaxNorm
+from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping, ModelCheckpoint
+from tensorflow.keras.optimizers import AdamW ,Adam
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+import pandas as pd
+import numpy as np
+import joblib
+import os
+import re
+import glob
+from datetime import datetime
+from sklearn.metrics import top_k_accuracy_score, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import skew,kurtosis
+from tensorflow.keras.losses import CategoricalCrossentropy
+from tensorflow.keras.mixed_precision import set_global_policy
+from sklearn.model_selection import train_test_split
+tf.keras.mixed_precision.set_global_policy('mixed_float16')
+from tensorflow.keras import backend as K
+K.clear_session()
+tf.keras.backend.clear_session()
+import gc
+gc.collect()
+
+file_path = '/home/X/k/research/Datasets/Quic/flows-20221031.csv'
+directory_path = '/home/X/k/research/Datasets/Quic/'
+modelName = './quic/transformer_model_enhanced_25062025.keras'
+ENCODER_DIR = './quicEncoders/'
+
+def load_data(file_path, directory_path):
+    return pd.read_csv(file_path, sep=',')
+
+def load_global_encoders():
+    scaler = joblib.load(f'{ENCODER_DIR}global_scaler.pkl')
+    cat_encoder = joblib.load(f'{ENCODER_DIR}global_categorical_encoder.pkl')
+    label_encoder = joblib.load(f'{ENCODER_DIR}global_label_encoder.pkl')
+    return cat_encoder, scaler, label_encoder
+
+def safe_fromstring(s):
+    if isinstance(s, str):
+        cleaned = re.findall(r'[-+]?\d*\.\d+|\d+', s.strip('[]'))
+        return np.array([float(x) for x in cleaned])
+    return np.array([])
+
+def process_sequence_column(column, maxlen=100):
+    return pad_sequences(
+        column.apply(safe_fromstring).tolist(),
+        maxlen=maxlen, padding='post', dtype='float32'
+    )
+
+full_data = load_data(file_path, directory_path)
+def preprocess_features(data):
+    print("Preprocessing started...")
+    # Sequences
+    PPI_seq = process_sequence_column(data['PPI'])
+    PHIST_SRC_seq = process_sequence_column(data['PHIST_SRC_SIZES'])
+    PHIST_DST_seq = process_sequence_column(data['PHIST_DST_SIZES'])
+
+    PPI_seq = PPI_seq.reshape((PPI_seq.shape[0], PPI_seq.shape[1], 1))
+    PHIST_SRC_seq = PHIST_SRC_seq.reshape((PHIST_SRC_seq.shape[0], PHIST_SRC_seq.shape[1], 1))
+    PHIST_DST_seq = PHIST_DST_seq.reshape((PHIST_DST_seq.shape[0], PHIST_DST_seq.shape[1], 1))
+
+    numerical_cols = ['SRC_PORT', 'DST_PORT', 'DURATION', 'BYTES', 'BYTES_REV',
+                       'PACKETS', 'PACKETS_REV', 'PPI_LEN', 'PPI_DURATION']
+    categorical_cols = ['QUIC_VERSION']
+    label_col = 'APP'
+
+    cat_encoder, scaler, label_encoder = load_global_encoders()
+
+    X_num_scaled = scaler.transform(data[numerical_cols])
+    X_cat = cat_encoder.transform(data[categorical_cols])
+
+    X_processed = np.concatenate([X_num_scaled, X_cat], axis=1)
+
+    labels = data[label_col]
+    label_map = {label: idx for idx, label in enumerate(label_encoder["classes_"])}
+    y_encoded = labels.map(label_map)
+
+    mask = ~y_encoded.isna()
+    X_processed = X_processed[mask]
+    PPI_seq = PPI_seq[mask]
+    PHIST_SRC_seq = PHIST_SRC_seq[mask]
+    PHIST_DST_seq = PHIST_DST_seq[mask]
+    y_encoded = y_encoded[mask].astype(int)
+
+    return X_processed, PPI_seq, PHIST_SRC_seq, PHIST_DST_seq, y_encoded
+
+    def build_model(num_cat_dim, sequence_length, num_classes):
+    input_num_cat = Input(shape=(num_cat_dim,))
+    input_ppi = Input(shape=(sequence_length, 1))
+    input_phist_src = Input(shape=(sequence_length, 1))
+    input_phist_dst = Input(shape=(sequence_length, 1))
+
+    x_num_cat = Dense(256, activation='relu')(input_num_cat)
+    x_num_cat = BatchNormalization()(x_num_cat)
+    x_num_cat = Dropout(0.3)(x_num_cat)
+    num_heads =8
+    x_ppi = Bidirectional(GRU(128, return_sequences=True))(input_ppi)
+    x_ppi = MultiHeadAttention(num_heads=num_heads, key_dim=64)(x_ppi, x_ppi)
+    x_ppi = GlobalAveragePooling1D()(x_ppi)
+    #x_ppi = Flatten()(x_ppi) 
+    # PHIST_SRC
+    x_phist_src = Bidirectional(GRU(128, return_sequences=True))(input_phist_src)
+    x_phist_src = MultiHeadAttention(num_heads=num_heads, key_dim=64)(x_phist_src, x_phist_src)
+    x_phist_src = GlobalAveragePooling1D()(x_phist_src)
+    #x_phist_src = Flatten()(x_phist_src)
+
+    # PHIST_DST
+    x_phist_dst = Bidirectional(GRU(128, return_sequences=True))(input_phist_dst)
+    x_phist_dst = MultiHeadAttention(num_heads=num_heads, key_dim=64)(x_phist_dst, x_phist_dst)
+    x_phist_dst = GlobalAveragePooling1D()(x_phist_dst)
+    #x_phist_dst = Flatten()(x_phist_dst)
+
+    combined = concatenate([x_num_cat, x_ppi, x_phist_src, x_phist_dst])
+
+    combined = Dense(128, activation='relu')(combined)
+    combined = BatchNormalization()(combined)
+    combined = Dropout(0.3)(combined)
+
+    output = Dense(num_classes, activation='softmax')(combined)
+
+    model = Model(
+        inputs=[input_num_cat, input_ppi, input_phist_src, input_phist_dst],
+        outputs=output
+    )
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-5),
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+
+    return model
+
+data = full_data
+X_processed, PPI_seq, PHIST_SRC_seq, PHIST_DST_seq, y_encoded = preprocess_features(data)
+
+# Split data
+train_idx, test_idx = train_test_split(
+    np.arange(X_processed.shape[0]), test_size=0.2, random_state=42, shuffle=True
+)
+
+X_train_num_cat, X_test_num_cat = X_processed[train_idx], X_processed[test_idx]
+X_train_ppi, X_test_ppi = PPI_seq[train_idx], PPI_seq[test_idx]
+X_train_phist_src, X_test_phist_src = PHIST_SRC_seq[train_idx], PHIST_SRC_seq[test_idx]
+X_train_phist_dst, X_test_phist_dst = PHIST_DST_seq[train_idx], PHIST_DST_seq[test_idx]
+y_train, y_test = y_encoded.iloc[train_idx], y_encoded.iloc[test_idx]
+
+model = build_model(
+    num_cat_dim=X_train_num_cat.shape[1],
+    sequence_length=X_train_ppi.shape[1],
+    num_classes=len(np.unique(y_encoded))
+)
+
+
+
+early_stopping = EarlyStopping(monitor='val_loss', patience=50, restore_best_weights=True)
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-6)
+model_checkpoint = ModelCheckpoint(modelName, monitor='val_loss', save_best_only=True, verbose=1)
+print(datetime.now())
+history = model.fit(
+    [X_train_num_cat, X_train_ppi, X_train_phist_src, X_train_phist_dst],
+    y_train,
+    validation_data=(
+        [X_test_num_cat, X_test_ppi, X_test_phist_src, X_test_phist_dst],
+        y_test
+    ),
+    epochs=50,
+    batch_size=256,
+    callbacks=[early_stopping, reduce_lr, model_checkpoint],
+    verbose=1
+)
